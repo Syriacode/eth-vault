@@ -1,21 +1,21 @@
 # Interview questions: eth-vault
 
-## Q1. TODO
+## Q1. Walk me through checks-effects-interactions in `withdrawAll`. What breaks if you swap the order, and what real hack is this?
 
-Answer: TODO
+Answer: `withdrawAll` first checks: it reads the caller's `balanceOf` and reverts with `ZeroAmount` if it's 0. Then it applies the effects: it sets the balance to 0 and emits `Withdrawn`. Only then does it interact, sending the ETH with `call` and reverting with `TransferFailed` if that fails. The order matters because `call` hands control to the receiver, and a contract receiver can call `withdrawAll` again before the first call finishes. With the balance already at 0, that nested call reverts, so the attack fails. If you send first and update after, the nested call still sees the old balance and gets paid again, and that loop repeats until the vault is empty: in `test/Reentrancy.t.sol` a 1 ETH deposit drained all 10 ETH. That's the reentrancy bug behind The DAO hack in 2016, where about 3.6M ETH was drained and Ethereum hard-forked to reverse it.
 
-## Q2. TODO
+## Q2. When I broke `withdraw(amount)` the same way, the attack failed with panic 0x11, but breaking `withdrawAll` drained the vault. Why? Should you rely on that?
 
-Answer: TODO
+Answer: Panic `0x11` is Solidity 0.8's arithmetic overflow/underflow check. In a broken `withdraw` written as `balanceOf[msg.sender] -= amount`, every nested call passes the check (each sees the old balance) and gets paid, but on the way back out each frame subtracts from storage again. The innermost frame takes the balance from 1 to 0, the next one tries 0 − 1 and panics. That panic makes the attacker's `receive()` revert, the outer `call` returns false, `TransferFailed` bubbles up, and the whole transaction rolls back. `withdrawAll` has no subtraction, only `balanceOf[msg.sender] = 0`, which never underflows, so every frame succeeds and the vault is drained. You should not rely on that: it's an accident of how the line is written. Our `withdraw` caches `available` and writes `available - amount`, which would never underflow and would drain just like `withdrawAll`, and so would anything inside `unchecked {}`. The fix is the ordering (CEI, plus a guard), not checked math.
 
-## Q3. TODO
+## Q3. Why use `call{value:}` instead of `transfer()` or `send()`, and what does that force you to do?
 
-Answer: TODO
+Answer: `transfer()` and `send()` forward only a 2300 gas stipend. That's enough to log an event, but not to do real work, so ETH sent to multisigs, proxies and other smart-contract wallets can fail. The stipend also depends on opcode gas prices, which have changed before: EIP-1884 (2019) made `SLOAD` more expensive and broke contracts that relied on 2300 gas being enough. `call{value: amount}("")` forwards almost all remaining gas, so any wallet can receive. The cost is that the receiver can now run arbitrary code, including calling back into the vault, so reentrancy safety has to come from CEI (and ideally a guard) instead of from the gas limit. It also returns `false` instead of reverting, so you must check the result, which the vault does with `if (!ok) revert TransferFailed();`. `send()` has the same silent-`false` issue, plus the stipend problem.
 
-## Q4. TODO
+## Q4. The vault has no `receive()`. Can its ETH balance still be higher than the sum of all deposits? What does that mean for accounting?
 
-Answer: TODO
+Answer: Yes. No `receive()` only blocks normal transfers and calls; some ETH arrives without running any of the vault's code. `selfdestruct` sends a contract's ETH to any address, and that can't be refused (after EIP-6780 it still moves the ETH, even though it usually no longer deletes the code). ETH can also be sent to the vault's address before it's deployed, since `CREATE`/`CREATE2` addresses are predictable, and validator rewards or withdrawals can be pointed at it. So the invariant is `address(this).balance >= sum(balanceOf)`, not `==`. The vault handles this correctly by never using `address(this).balance` in its logic: `balanceOf` is the only source of truth, so forced ETH can't inflate anyone's balance. The downside is that the extra ETH is credited to nobody and stuck forever, unless you add an admin `sweep`, which brings in trust and risk.
 
-## Q5. TODO
+## Q5. Before mainnet, what would you add for defense in depth? Cover reentrancy guards (including transient storage), cross-function and read-only reentrancy, and pausing.
 
-Answer: TODO
+Answer: I'd add a `nonReentrant` modifier to `deposit`, `withdraw` and `withdrawAll` on top of CEI. A single shared lock blocks reentering the same function, and also **cross-function** reentrancy, where the callback enters a different function that touches the same state (for example `withdraw` from inside `withdrawAll`). OpenZeppelin's `ReentrancyGuardTransient` stores that lock in transient storage (EIP-1153 `TSTORE`/`TLOAD`, available since the Cancun upgrade). The lock is cleared automatically at the end of the transaction and costs far less than an `SSTORE`-based guard. **Read-only reentrancy** is when another protocol calls a `view` function during your callback and reads inconsistent state, as with Curve's `get_virtual_price` exploits. A guard doesn't cover views unless they check the lock themselves. Our vault is safe here only because CEI means `balanceOf` is already correct before the `call`. For emergencies I'd add OpenZeppelin `Pausable`, owned by a multisig behind a timelock, pausing at least `deposit`. Whether to also pause withdrawals is a deliberate choice: pausing them can stop a drain, but it can also trap users' funds. I'd finish with invariant tests (`address(this).balance >= sum(balanceOf)`), static analysis (`forge lint`, Slither) and an external audit.
